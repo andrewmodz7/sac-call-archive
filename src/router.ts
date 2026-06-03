@@ -106,7 +106,19 @@ export function buildFilename(call: CloudtalkCall): string {
   const p = easternParts(call.Cdr.started_at);
   const stamp = `${p.year}-${p.month}-${p.day}_${p.hour}-${p.minute}`;
   // CloudTalk serves WAV (confirmed live); we store the bytes as-is, no transcode.
-  return `${nameComponent(call)}_${stamp}.wav`;
+  // State leads the name so files in a folder group by state alphabetically.
+  return `${stateComponent(call)}_${nameComponent(call)}_${stamp}.wav`;
+}
+
+// Contact.state sanitized like the name. Missing/empty falls back to the literal
+// "Unknown" (never skipped) so the filename keeps a consistent segment count.
+function stateComponent(call: CloudtalkCall): string {
+  const raw = (call.Contact?.state ?? "").trim();
+  if (raw) {
+    const sanitized = raw.replace(/\s+/g, "_").replace(/[^A-Za-z0-9_-]/g, "");
+    if (sanitized) return sanitized;
+  }
+  return "Unknown";
 }
 
 // Contact.name is a single string. Spaces become underscores, then strip

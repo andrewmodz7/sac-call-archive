@@ -18,6 +18,9 @@ export interface AgentFields {
 export interface ContactFields {
   // single full-name string, e.g. "Andrew Test". May be null/empty.
   name: string | null;
+  // US state code, e.g. "NV", "GA", "AL". Probe data shows it's always present
+  // as a string or null.
+  state: string | null;
 }
 
 export interface Tag {
