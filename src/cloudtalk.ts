@@ -33,31 +33,20 @@ export async function listCalls(page: number, limit: number): Promise<ResponseDa
 }
 
 // Single call. The webhook payload may not carry the full call object, so we
-// fetch it here. Same envelope as the list endpoint; data is one item, which
-// CloudTalk may return either as a bare object or a one-element array.
-//
-// TODO(detail-endpoint): calls/show.json/{id} below does NOT exist. CloudTalk's
-// docs show two real detail paths:
-//   - GET /api/calls/index.json?call_id={id}  (list envelope filtered to one
-//     call — matches our existing ResponseData/CloudtalkCall types)
-//   - GET /api/calls/{id}                      (newer flat format, no .json:
-//     {cdr_id, contact, call_tags, notes, recorded, ...} — different shape)
-// Tomorrow's live webhook test will reveal whether the webhook payload already
-// carries the full call inline; if so we delete this path entirely. If a detail
-// fetch IS still needed, switch the URL to the filtered index.json endpoint
-// since it returns our existing list envelope. See the call site in index.ts.
+// fetch it here using the list endpoint filtered to one call_id — CloudTalk has
+// no working single-call detail path (calls/show.json/{id} 404s under its
+// CakePHP routing). Same collections envelope as listCalls; we take data[0].
 export async function getCall(callId: string): Promise<CloudtalkCall> {
-  const url = `${BASE_URL}calls/show.json/${encodeURIComponent(callId)}`;
+  const url = `${BASE_URL}calls/index.json?call_id=${encodeURIComponent(callId)}&limit=1`;
   const res = await fetch(url, {
     headers: { Authorization: authHeader(), Accept: "application/json" },
   });
   if (!res.ok) {
-    throw new Error(`show.json ${callId} failed: ${res.status} ${res.statusText}`);
+    throw new Error(`index.json call_id=${callId} failed: ${res.status} ${res.statusText}`);
   }
-  const json = (await res.json()) as { responseData?: { data?: CloudtalkCall | CloudtalkCall[] } };
-  const data = json.responseData?.data;
-  const call = Array.isArray(data) ? data[0] : data;
-  if (!call) throw new Error(`show.json ${callId}: no call in response`);
+  const json = (await res.json()) as { responseData?: ResponseData };
+  const call = json.responseData?.data?.[0];
+  if (!call) throw new Error(`getCall(${callId}) returned no items`);
   return call;
 }
 
