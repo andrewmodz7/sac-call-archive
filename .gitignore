@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+.env
+*.log
+
+# Local curl / probe debris (live-test scratch files)
+*.bin
+headers*.txt
+*.wav
