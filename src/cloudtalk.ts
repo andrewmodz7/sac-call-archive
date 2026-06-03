@@ -93,8 +93,49 @@ export type RecordingResult = RecordingSuccess | RecordingFailure;
 //   c. octet-stream AND content-length > 1024  (small bodies are JSON errors)
 // Otherwise it's not a recording (HTML login page, JSON error, empty body): we
 // return a failure carrying a body sample so the caller can log it.
+//
+// Retry: CloudTalk now fires the webhook on "Call Ended", so the handler can run
+// before the recording finishes uploading — that window returns 404. We treat
+// 404 (and any 5xx) as transient and retry with exponential backoff up to the
+// delays below (~2.25 min total). 410 (purged after retention) is permanent and
+// every other failure (auth, malformed, HTML) is immediate. On exhaustion we
+// return the last failure unchanged so process.ts logic is untouched.
+const RETRY_DELAYS_MS = [5000, 10000, 20000, 40000, 60000];
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 export async function downloadRecording(callId: string): Promise<RecordingResult> {
   const url = `${BASE_URL}calls/recording/${encodeURIComponent(callId)}.json`;
+
+  for (let attempt = 0; ; attempt++) {
+    const result = await attemptDownload(url);
+    if (result.ok) return result;
+
+    // 404 = not uploaded yet; 5xx = transient server error. Both retry on the
+    // same backoff/cap. 410 and everything else fall through and return.
+    const retriable = result.status === 404 || (result.status >= 500 && result.status <= 599);
+    const nextDelayMs = RETRY_DELAYS_MS[attempt];
+    if (retriable && nextDelayMs !== undefined) {
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          level: "info",
+          msg: "recording not ready, retrying",
+          call_id: callId,
+          attempt: attempt + 1,
+          next_delay_ms: nextDelayMs,
+        }),
+      );
+      await sleep(nextDelayMs);
+      continue;
+    }
+    return result;
+  }
+}
+
+// A single download attempt. Returns the recording stream on success, or a
+// failure carrying enough detail to log and to decide whether to retry.
+async function attemptDownload(url: string): Promise<RecordingResult> {
   const res = await fetch(url, {
     headers: { Authorization: authHeader() },
     redirect: "follow",
