@@ -18,9 +18,12 @@ function authHeader(): string {
   return `Basic ${Buffer.from(`${id}:${secret}`).toString("base64")}`;
 }
 
-// List endpoint, one page. Used by the backfill.
-export async function listCalls(page: number, limit: number): Promise<ResponseData> {
-  const url = `${BASE_URL}calls/index.json?page=${page}&limit=${limit}`;
+// List endpoint, one page. Used by the backfill. `dateFrom` (ISO timestamp) is
+// passed through as CloudTalk's documented date_from filter so the server only
+// returns calls started on or after it.
+export async function listCalls(page: number, limit: number, dateFrom?: string): Promise<ResponseData> {
+  const dateFilter = dateFrom ? `&date_from=${encodeURIComponent(dateFrom)}` : "";
+  const url = `${BASE_URL}calls/index.json?page=${page}&limit=${limit}${dateFilter}`;
   const res = await fetch(url, {
     headers: { Authorization: authHeader(), Accept: "application/json" },
   });
