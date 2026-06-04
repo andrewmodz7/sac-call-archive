@@ -48,6 +48,17 @@ export interface ProcessedRow {
   drive_file_id: string | null;
 }
 
+// Full row lookup, for callers that need to know HOW a call was processed
+// (the backfill re-evaluates skipped_no_disposition rows, see backfill.ts).
+export function getProcessed(callId: string): ProcessedRow | undefined {
+  return db
+    .prepare(
+      `SELECT call_id, agent_name, disposition, action, drive_file_id
+       FROM processed_calls WHERE call_id = ?`,
+    )
+    .get(callId) as ProcessedRow | undefined;
+}
+
 export function recordResult(row: ProcessedRow): void {
   db.prepare(
     `INSERT OR REPLACE INTO processed_calls
