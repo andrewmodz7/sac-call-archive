@@ -4,7 +4,7 @@
 // so both behave identically.
 
 import { Readable } from "node:stream";
-import { downloadRecording } from "./cloudtalk.js";
+import { downloadRecording, getCall } from "./cloudtalk.js";
 import { recordResult } from "./db.js";
 import { resolveFolderPath, uploadMp3 } from "./drive.js";
 import { buildFilename, monthFolder, routeCall } from "./router.js";
@@ -12,6 +12,77 @@ import type { CloudtalkCall, ProcessedAction } from "./types.js";
 
 export function log(fields: Record<string, unknown>): void {
   console.log(JSON.stringify({ ts: new Date().toISOString(), ...fields }));
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Agents tag the disposition during a ~30s wrap-up window AFTER the call ends,
+// but CloudTalk fires the "Call Ended" webhook the instant it ends — so the
+// first fetch often sees an empty Tags[]. Same shape as the recording-download
+// retry in cloudtalk.ts: poll the call detail with backoff (~3 min total,
+// covering the wrap-up window plus a late-tagging buffer) before giving up.
+const TAG_POLL_DELAYS_MS = [15000, 15000, 30000, 60000, 60000];
+
+// Only poll calls that ended recently. Anything older either has its tag
+// already or never will.
+const TAG_POLL_MAX_AGE_MS = 5 * 60 * 1000;
+
+// When the call ended. If ended_at is missing or unparseable, assume it just
+// ended: polling only runs for webhook-triggered calls, and the webhook fires
+// at call end.
+function endedAtMs(call: CloudtalkCall): number {
+  const raw = call.Cdr.ended_at;
+  if (raw) {
+    const ms = new Date(raw).getTime();
+    if (!Number.isNaN(ms)) return ms;
+  }
+  return Date.now();
+}
+
+// Re-fetch the call until Tags[] is non-empty or the delays run out. Returns
+// the freshest call object either way; the caller routes whatever comes back.
+async function pollForTags(call: CloudtalkCall, start: number): Promise<CloudtalkCall> {
+  const callId = String(call.Cdr.id);
+
+  for (let attempt = 0; attempt < TAG_POLL_DELAYS_MS.length; attempt++) {
+    const nextDelayMs = TAG_POLL_DELAYS_MS[attempt] as number;
+    log({
+      level: "info",
+      msg: "tag not present yet, polling",
+      call_id: callId,
+      attempt: attempt + 1,
+      next_delay_ms: nextDelayMs,
+      elapsed_ms: Date.now() - start,
+    });
+    await sleep(nextDelayMs);
+
+    try {
+      const fresh = await getCall(callId);
+      if ((fresh.Tags ?? []).length > 0) {
+        log({
+          level: "info",
+          msg: "tag appeared on retry",
+          call_id: callId,
+          attempt: attempt + 1,
+          elapsed_ms: Date.now() - start,
+          tag_names: fresh.Tags.map((t) => t.name),
+        });
+        return fresh;
+      }
+      call = fresh;
+    } catch (err) {
+      // A transient fetch failure shouldn't abort the call: keep the last good
+      // object and let the remaining attempts try again.
+      log({
+        level: "warn",
+        msg: "tag poll fetch failed",
+        call_id: callId,
+        attempt: attempt + 1,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return call;
 }
 
 export interface ProcessOutcome {
@@ -24,9 +95,25 @@ export interface ProcessOutcome {
   error?: string;
 }
 
-export async function processCall(call: CloudtalkCall): Promise<ProcessOutcome> {
+export async function processCall(
+  call: CloudtalkCall,
+  options: { pollForTags?: boolean } = {},
+): Promise<ProcessOutcome> {
   const start = Date.now();
   const callId = String(call.Cdr.id);
+
+  // Webhook-triggered calls may arrive before the agent has tagged the
+  // disposition (see TAG_POLL_DELAYS_MS above). Backfill passes no options:
+  // its calls are old enough that the tag is either set or never coming, and
+  // polling would add minutes per untagged call.
+  if (
+    options.pollForTags &&
+    (call.Tags ?? []).length === 0 &&
+    Date.now() - endedAtMs(call) < TAG_POLL_MAX_AGE_MS
+  ) {
+    call = await pollForTags(call, start);
+  }
+
   const agent = call.Agent?.firstname ?? null;
   const route = routeCall(call);
 

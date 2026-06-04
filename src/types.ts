@@ -8,6 +8,7 @@ export interface CdrFields {
   is_voicemail: boolean;
   recording_link: string; // https://my.cloudtalk.io/r/play/{call_id}
   started_at: string; // ISO 8601 with offset, CloudTalk server is +02:00
+  ended_at?: string; // same format; may be absent on inline webhook payloads
   public_external: string; // prospect phone, E.164
 }
 

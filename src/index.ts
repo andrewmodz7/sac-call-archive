@@ -71,7 +71,9 @@ app.post("/webhooks/cloudtalk", (req, res) => {
       // which returns our existing list envelope. See cloudtalk.ts getCall().
       const inline = looksLikeCall(req.body) ? (req.body as CloudtalkCall) : null;
       const call = inline ?? (await getCall(callId));
-      await processCall(call);
+      // Poll for the disposition tag: the webhook fires at call end, but agents
+      // tag during the ~30s wrap-up window after. Backfill skips this.
+      await processCall(call, { pollForTags: true });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       log({ call_id: callId, action: "failed", error });
