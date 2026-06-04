@@ -26,14 +26,21 @@ export interface ListCallsFilters {
   dateTo?: string;
 }
 
+// Exported separately so the backfill can log the exact request URL it is
+// about to send (diagnostic for missing-call investigation).
+export function buildListCallsUrl(page: number, limit: number, filters: ListCallsFilters = {}): string {
+  let url = `${BASE_URL}calls/index.json?page=${page}&limit=${limit}`;
+  if (filters.dateFrom) url += `&date_from=${encodeURIComponent(filters.dateFrom)}`;
+  if (filters.dateTo) url += `&date_to=${encodeURIComponent(filters.dateTo)}`;
+  return url;
+}
+
 export async function listCalls(
   page: number,
   limit: number,
   filters: ListCallsFilters = {},
 ): Promise<ResponseData> {
-  let url = `${BASE_URL}calls/index.json?page=${page}&limit=${limit}`;
-  if (filters.dateFrom) url += `&date_from=${encodeURIComponent(filters.dateFrom)}`;
-  if (filters.dateTo) url += `&date_to=${encodeURIComponent(filters.dateTo)}`;
+  const url = buildListCallsUrl(page, limit, filters);
   const res = await fetch(url, {
     headers: { Authorization: authHeader(), Accept: "application/json" },
   });

@@ -20,9 +20,14 @@
 // Rate limit is 60 req/min, so sleep 1s between pages.
 
 import "dotenv/config";
-import { listCalls, type ListCallsFilters } from "./cloudtalk.js";
+import { buildListCallsUrl, listCalls, type ListCallsFilters } from "./cloudtalk.js";
 import { getProcessed, type ProcessedRow } from "./db.js";
 import { log, processCall } from "./process.js";
+
+// TODO(diagnostic): temporary instrumentation for the missing-call
+// investigation (call 1207821971 confirmed tagged + inside the date_to window
+// by direct curl, yet absent from backfill output). Remove once root-caused.
+const TEST_CALL_ID = "1207821971";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const PAGE_LIMIT = 1000; // CloudTalk supports up to 1000 per page
@@ -132,13 +137,37 @@ async function main(): Promise<void> {
   let oldestMs = Infinity;
   let newestMs = -Infinity;
 
+  // Diagnostic accounting: every id the API returned, every id the loop
+  // actually iterated, and every request URL — so a missing call is provably
+  // either absent from the responses or dropped by our own code.
+  const requestUrls: string[] = [];
+  const receivedIds: string[] = [];
+  const iteratedIds = new Set<string>();
+  let itemsIterated = 0;
+
   do {
+    const url = buildListCallsUrl(page, PAGE_LIMIT, filters);
+    log({ level: "info", msg: "fetching page", url, page, limit: PAGE_LIMIT });
+    requestUrls.push(url);
+
     const rd = await listCalls(page, PAGE_LIMIT, filters);
     pageCount = rd.pageCount || 1;
     const items = rd.data ?? [];
     pagesRead++;
+    for (const c of items) receivedIds.push(String(c.Cdr.id));
 
     for (const call of items) {
+      log({
+        level: "debug",
+        msg: "page item",
+        call_id: String(call.Cdr.id),
+        started_at: call.Cdr.started_at,
+        tags_count: (call.Tags ?? []).length,
+        recorded: call.Cdr.recorded,
+      });
+      iteratedIds.add(String(call.Cdr.id));
+      itemsIterated++;
+
       const startedAt = call.Cdr.started_at;
       const startedMs = new Date(startedAt).getTime();
       if (!Number.isNaN(startedMs)) {
@@ -155,6 +184,7 @@ async function main(): Promise<void> {
       const id = String(call.Cdr.id);
       const existing = getProcessed(id);
       if (isDefinitivelyDone(existing)) {
+        log({ level: "info", msg: "dedup skip", call_id: id, prior_action: existing?.action });
         alreadyDone++;
         continue;
       }
@@ -183,6 +213,27 @@ async function main(): Promise<void> {
 
   if (pageCount > MAX_PAGES) {
     log({ level: "warn", msg: "hit MAX_PAGES before exhausting pageCount", pageCount, MAX_PAGES });
+  }
+
+  // Diagnostic: received vs iterated must match; anything the API returned but
+  // the loop never touched is a bug in our code, not CloudTalk's.
+  if (receivedIds.length !== itemsIterated) {
+    log({
+      level: "warn",
+      msg: "items received vs iterated mismatch",
+      items_received: receivedIds.length,
+      items_iterated: itemsIterated,
+      missing_ids: receivedIds.filter((id) => !iteratedIds.has(id)),
+    });
+  }
+
+  // Diagnostic: the known-tagged test call must show up in some page's items.
+  if (!receivedIds.includes(TEST_CALL_ID)) {
+    log({
+      level: "error",
+      msg: `call ${TEST_CALL_ID} missing from all pages despite being within cutoff window`,
+      request_urls: requestUrls,
+    });
   }
 
   log({
