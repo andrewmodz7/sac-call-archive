@@ -13,6 +13,9 @@ const ARCHIVE_DISPOSITIONS: Record<string, string> = {
   "Not Interested": "Not Interested",
   "Do Not Call": "Do Not Call",
   "Wrong Person / Bad Contact": "Wrong Person - Bad Contact", // slash breaks folder paths
+  "Deck Sent - Follow-up booked": "Deck Sent - Follow-up booked",
+  "Deck Sent - No follow-up": "Deck Sent - No follow-up",
+  "Newsletter Opt-in": "Newsletter Opt-in",
 };
 
 // Dispositions we recognize but intentionally do not archive.
