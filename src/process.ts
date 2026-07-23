@@ -7,7 +7,13 @@ import { Readable } from "node:stream";
 import { downloadRecording, getCall } from "./cloudtalk.js";
 import { recordResult } from "./db.js";
 import { resolveFolderPath, uploadMp3 } from "./drive.js";
-import { buildFilename, monthFolder, routeCall } from "./router.js";
+import {
+  buildFilename,
+  driveRootEnvVar,
+  folderSegments,
+  resolveAgentIdentity,
+  routeCall,
+} from "./router.js";
 import type { CloudtalkCall, ProcessedAction } from "./types.js";
 
 export function log(fields: Record<string, unknown>): void {
@@ -114,14 +120,18 @@ export async function processCall(
     call = await pollForTags(call, start);
   }
 
-  const agent = call.Agent?.firstname ?? null;
+  // Resolved identity, not the raw CloudTalk firstname: calls made from Frank's
+  // seat are Joe's. This is what gets written to processed_calls.agent_name and
+  // what drives the folder path, so reporting stays accurate going forward.
+  // Rows already written as "Frank" are left untouched.
+  const agent = resolveAgentIdentity(call.Agent?.firstname);
   const route = routeCall(call);
 
   const finish = (
     action: ProcessedAction,
     disposition: string | null,
     driveFileId: string | null,
-    extra?: { error?: string; tags?: string[] },
+    extra?: { error?: string; tags?: string[]; filename?: string },
   ): ProcessOutcome => {
     recordResult({
       call_id: callId,
@@ -141,6 +151,7 @@ export async function processCall(
     if (extra?.error) outcome.error = extra.error;
     const line: Record<string, unknown> = { ...outcome };
     if (extra?.tags) line.tags = extra.tags;
+    if (extra?.filename) line.filename = extra.filename;
     log(line);
     return outcome;
   };
@@ -154,8 +165,10 @@ export async function processCall(
 
   // Archive path.
   try {
-    const segments = [agent ?? "Unknown Agent", route.folderName, monthFolder(call.Cdr.started_at)];
-    const folderId = await resolveFolderPath(segments);
+    // Joe files under his own Drive root with no agent level; everyone else
+    // keeps {Agent}/{Disposition}/{YYYY-MM} under the shared root.
+    const segments = folderSegments(agent, route.folderName, call.Cdr.started_at);
+    const folderId = await resolveFolderPath(segments, driveRootEnvVar(agent));
     const filename = buildFilename(call);
 
     const result = await downloadRecording(callId);
@@ -179,7 +192,10 @@ export async function processCall(
     const stream = Readable.fromWeb(result.body as Parameters<typeof Readable.fromWeb>[0]);
     const fileId = await uploadMp3({ folderId, filename, body: stream });
 
-    return finish("archived", route.disposition, fileId);
+    // filename in the log line: the only way to confirm from prod logs that
+    // Contact.address actually resolved for Joe's calls rather than silently
+    // falling back to Unknown_{digits}.
+    return finish("archived", route.disposition, fileId, { filename });
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     return finish("failed", route.disposition, null, { error });

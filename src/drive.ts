@@ -31,9 +31,13 @@ function getDrive(): drive_v3.Drive {
   return driveClient;
 }
 
-function rootFolderId(): string {
-  const id = process.env.DRIVE_ROOT_FOLDER_ID;
-  if (!id) throw new Error("Missing required env var: DRIVE_ROOT_FOLDER_ID");
+// There is more than one root now: the shared "CloudTalk Recordings" folder
+// (DRIVE_ROOT_FOLDER_ID) and Joe's separate folder (JOE_DRIVE_ROOT_FOLDER_ID),
+// which is not nested under it. The caller names the env var; router.ts decides
+// which one applies. Both are shared with the service account manually.
+function rootFolderId(envVar: string): string {
+  const id = process.env[envVar];
+  if (!id) throw new Error(`Missing required env var: ${envVar}`);
   return id;
 }
 
@@ -65,15 +69,26 @@ async function createFolder(parentId: string, name: string): Promise<string> {
   return id;
 }
 
-// Walk the segments under the root folder, reusing cached ids and creating any
-// missing level. Cache key is the cumulative path under the root, so the same
-// folder name under two different agents never collides.
-export async function resolveFolderPath(segments: string[]): Promise<string> {
-  let parentId = rootFolderId();
-  let pathKey = "";
+// Walk the segments under the given root folder, reusing cached ids and
+// creating any missing level.
+//
+// Cache key is the root folder id plus the cumulative path under it. The root
+// id has to be part of the key: Joe's root has "Not Interested/2026-07" at the
+// top level, and so would any future root, so a path-only key would hand back
+// the wrong folder id across roots. Existing folder_cache rows written under
+// the old path-only key are simply never hit again — the first lookup per path
+// re-resolves against Drive, finds the folder that is already there, and
+// re-caches it under the new key. No duplicate folders, no migration.
+export async function resolveFolderPath(
+  segments: string[],
+  rootEnvVar = "DRIVE_ROOT_FOLDER_ID",
+): Promise<string> {
+  const rootId = rootFolderId(rootEnvVar);
+  let parentId = rootId;
+  let pathKey = rootId;
 
   for (const segment of segments) {
-    pathKey = pathKey ? `${pathKey}/${segment}` : segment;
+    pathKey = `${pathKey}/${segment}`;
 
     const cached = getCachedFolder(pathKey);
     if (cached) {

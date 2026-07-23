@@ -5,9 +5,34 @@ downloads the call recording, and files it into Google Drive organized by
 agent, disposition, and month. Built for Shore Acres Capital to keep a
 searchable archive of cold-call recordings segmented by outcome.
 
+Two agents, two layouts. Jay files under the shared root; Joe files under his
+own separate Drive root with a different filename format:
+
 ```
-/CloudTalk Recordings/{Agent}/{Disposition}/{YYYY-MM}/{Name}_{YYYY-MM-DD}_{HH-MM}.mp3
+Jay:  /CloudTalk Recordings/{Agent}/{Disposition}/{YYYY-MM}/{State}_{Name}_{YYYY-MM-DD}_{HH-MM}.wav
+Joe:  /{Joe root}/{Disposition}/{YYYY-MM}/{Address}_{YYYY-MM-DD}.wav
 ```
+
+### Agent identity
+
+Joe makes his calls while logged into Frank Deliessche's CloudTalk seat, so
+every call CloudTalk reports with `Agent.firstname === "Frank"` is really Joe's.
+`resolveAgentIdentity` in `src/router.ts` maps `Frank -> Joe`, and that resolved
+name is what drives the disposition set, the Drive root, the folder path, the
+filename format, and the `agent_name` column. Rows written before this change
+still say `Frank`; they are deliberately left alone. Remove the entry from
+`AGENT_IDENTITY_OVERRIDES` if Frank ever starts making his own calls.
+
+Every agent other than Joe keeps the original behavior and Jay's disposition
+set, so routing does not depend on Jay's exact CloudTalk firstname.
+
+> **Filename collision risk (Joe only).** `{Address}_{YYYY-MM-DD}.wav` has no
+> time component, so two calls to the same address on the same day produce the
+> same filename — and Drive allows duplicate names in a folder, so the second
+> upload silently lands beside the first rather than replacing it or erroring.
+> Both recordings are kept and both are reachable, but they are not
+> distinguishable by name. Accepted as-is; add a time component if that becomes
+> a problem.
 
 ## How it works
 
@@ -86,7 +111,12 @@ contents on a single line:
 ```
 GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":...}
 DRIVE_ROOT_FOLDER_ID=<the folder id from step 5>
+JOE_DRIVE_ROOT_FOLDER_ID=<folder id of Joe's separate root folder>
 ```
+
+`JOE_DRIVE_ROOT_FOLDER_ID` is an independent root, not a subfolder of
+`DRIVE_ROOT_FOLDER_ID`. It needs the same **Editor** share with the service
+account as step 6.
 
 To flatten the JSON to one line:
 
@@ -178,7 +208,8 @@ src/
   index.ts       express server, webhook route
   cloudtalk.ts   api client, auth, recording download, signature check
   drive.ts       drive client, lazy folder resolver with cache, upload
-  router.ts      disposition map, skip list, folder + filename logic
+  router.ts      agent identity, per-agent disposition maps, skip list,
+                 folder + filename logic
   process.ts     one call end to end, shared by webhook and backfill
   db.ts          sqlite init + helpers
   backfill.ts    7-day catch-up script

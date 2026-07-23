@@ -22,6 +22,17 @@ export interface ContactFields {
   // US state code, e.g. "NV", "GA", "AL". Probe data shows it's always present
   // as a string or null.
   state: string | null;
+  // Street address, used for Joe's filenames. CloudTalk's contact model carries
+  // address / city / zip / state as separate fields (same family as `state`
+  // above, which the probe already confirmed on the call payload), so this is
+  // the single-line street address, not a composed one.
+  //
+  // NOT yet confirmed present on the call payload's Contact sub-object — the
+  // original probe only recorded the fields we needed then. Optional here so a
+  // payload without it type-checks and degrades to the Unknown_{digits}
+  // fallback rather than crashing. Run `npm run probe` against live data to
+  // confirm before Joe's first real call. See router.ts addressComponent.
+  address?: string | null;
 }
 
 export interface Tag {

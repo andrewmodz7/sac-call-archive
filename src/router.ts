@@ -1,24 +1,81 @@
 // Routing decisions and naming. Pure functions, no IO. Given a call object this
 // decides whether to archive (and into which folder) or skip (and why), and
 // builds the Drive folder path + filename.
+//
+// Everything here keys off the *resolved* agent identity, not the raw CloudTalk
+// firstname. See resolveAgentIdentity below.
 
 import type { CloudtalkCall, ProcessedAction } from "./types.js";
 
-// Dispositions we archive. Key is the exact Tags[].name string from CloudTalk,
-// value is the folder name (some labels have characters that break paths).
-const ARCHIVE_DISPOSITIONS: Record<string, string> = {
-  "Appointment Set": "Appointment Set",
-  "Interested - No Book": "Interested - No Book",
-  "Callback Requested": "Callback Requested",
-  "Not Interested": "Not Interested",
-  "Do Not Call": "Do Not Call",
-  "Wrong Person / Bad Contact": "Wrong Person - Bad Contact", // slash breaks folder paths
-  "Deck Sent - Follow-up booked": "Deck Sent - Follow-up booked",
-  "Deck Sent - No follow-up": "Deck Sent - No follow-up",
-  "Newsletter Opt-in": "Newsletter Opt-in",
+// --- Agent identity ---------------------------------------------------------
+
+// Joe (acquisitions cold calling) makes his calls while logged into Frank
+// Deliessche's CloudTalk seat. There is no separate "Joe" user in CloudTalk, so
+// every call that comes back with Agent.firstname === "Frank" is actually Joe's;
+// Frank does not make these calls himself.
+//
+// This mapping is the ONLY place that fact lives. If Frank ever starts making
+// his own calls, delete the entry and Frank routes as Frank again — nothing
+// else needs to change. Historical rows already written as "Frank" are left
+// alone on purpose; the override only affects calls processed from here on.
+const AGENT_IDENTITY_OVERRIDES: Record<string, string> = {
+  Frank: "Joe",
 };
 
-// Dispositions we recognize but intentionally do not archive.
+// Resolved identity constant. Joe gets his own disposition set, his own Drive
+// root, and his own filename format; every other agent keeps the original
+// behavior.
+export const JOE = "Joe";
+
+export function resolveAgentIdentity(rawFirstname: string | null | undefined): string | null {
+  const raw = (rawFirstname ?? "").trim();
+  if (!raw) return null;
+  return AGENT_IDENTITY_OVERRIDES[raw] ?? raw;
+}
+
+function isJoe(agent: string | null): boolean {
+  return agent === JOE;
+}
+
+// --- Dispositions -----------------------------------------------------------
+
+// Dispositions we archive, per agent. Key is the exact Tags[].name string from
+// CloudTalk, value is the folder name (some labels have characters that break
+// paths). A tag absent from an agent's map is NOT archived: it either matches
+// SKIP_DISPOSITIONS or falls through to skipped_no_disposition. Never guessed.
+
+// Jay's set. Jay keeps his existing CloudTalk identity, folder structure and
+// filename format; only this list changed.
+const JAY_ARCHIVE_DISPOSITIONS: Record<string, string> = {
+  "Brief Sent - Info Yes": "Brief Sent - Info Yes",
+  "Appointment Set": "Appointment Set",
+  "Newsletter Opt-in": "Newsletter Opt-in",
+  "Callback Requested": "Callback Requested",
+  "Wrong Person / Bad Contact": "Wrong Person - Bad Contact", // slash breaks folder paths
+  "Not Interested": "Not Interested",
+  "Do Not Call": "Do Not Call",
+};
+
+// Joe's set (the Frank seat). Note "Wrong Number", not "Wrong Person".
+const JOE_ARCHIVE_DISPOSITIONS: Record<string, string> = {
+  "Offer Appointment Set": "Offer Appointment Set",
+  "Interested - More Info Needed": "Interested - More Info Needed",
+  "Not Now - Nurture": "Not Now - Nurture",
+  "Callback Requested": "Callback Requested",
+  "Wrong Number / Bad Contact": "Wrong Number - Bad Contact", // slash breaks folder paths
+  "Not Interested": "Not Interested",
+  "Do Not Call": "Do Not Call",
+};
+
+// Jay's map is the default for every non-Joe agent, so routing stays correct
+// whatever Jay's raw CloudTalk firstname turns out to be.
+function archiveDispositions(agent: string | null): Record<string, string> {
+  return isJoe(agent) ? JOE_ARCHIVE_DISPOSITIONS : JAY_ARCHIVE_DISPOSITIONS;
+}
+
+// Dispositions we recognize but intentionally do not archive, for every agent.
+// "No Answer" stays here deliberately for both Jay and Joe: it is never
+// downloaded and never filed, whatever other reference material may suggest.
 const SKIP_DISPOSITIONS = new Set([
   "Voicemail Message Left",
   "Voicemail No Message Left",
@@ -36,6 +93,9 @@ export type RouteResult =
 
 export function routeCall(call: CloudtalkCall): RouteResult {
   const tagNames = (call.Tags ?? []).map((t) => t.name);
+  // Derived, not passed in, so the archive map can never disagree with the
+  // identity used for the folder path and the agent_name row.
+  const dispositions = archiveDispositions(resolveAgentIdentity(call.Agent?.firstname));
 
   // Order matters: recording flags first, then disposition. A call with no
   // recording or one flagged as voicemail never reaches a download.
@@ -47,7 +107,7 @@ export function routeCall(call: CloudtalkCall): RouteResult {
   }
 
   for (const name of tagNames) {
-    const folder = ARCHIVE_DISPOSITIONS[name];
+    const folder = dispositions[name];
     if (folder) {
       return { kind: "archive", folderName: folder, disposition: name };
     }
@@ -105,12 +165,57 @@ export function monthFolder(startedAt: string): string {
   return `${p.year}-${p.month}`;
 }
 
+// --- Drive location ---------------------------------------------------------
+
+// Which env var holds the Drive root for this agent. Joe's recordings go to a
+// completely separate Drive folder, not nested under the shared root at all.
+export function driveRootEnvVar(agent: string | null): string {
+  return isJoe(agent) ? "JOE_DRIVE_ROOT_FOLDER_ID" : "DRIVE_ROOT_FOLDER_ID";
+}
+
+// Folder segments beneath that root.
+//   Jay (and any other agent): {Agent}/{Disposition}/{YYYY-MM}  — unchanged
+//   Joe:                       {Disposition}/{YYYY-MM}          — his root is
+//                              already agent-specific, so no agent level.
+export function folderSegments(
+  agent: string | null,
+  folderName: string,
+  startedAt: string,
+): string[] {
+  const month = monthFolder(startedAt);
+  if (isJoe(agent)) return [folderName, month];
+  return [agent ?? "Unknown Agent", folderName, month];
+}
+
+// --- Filenames --------------------------------------------------------------
+
 export function buildFilename(call: CloudtalkCall): string {
+  const agent = resolveAgentIdentity(call.Agent?.firstname);
   const p = easternParts(call.Cdr.started_at);
-  const stamp = `${p.year}-${p.month}-${p.day}_${p.hour}-${p.minute}`;
+  const date = `${p.year}-${p.month}-${p.day}`;
+
   // CloudTalk serves WAV (confirmed live); we store the bytes as-is, no transcode.
+  if (isJoe(agent)) {
+    // Joe works from property addresses, so the address is the identifying
+    // part of the name. No time component by request — see the collision note
+    // in the README.
+    return `${addressComponent(call)}_${date}.wav`;
+  }
+
   // State leads the name so files in a folder group by state alphabetically.
-  return `${stateComponent(call)}_${nameComponent(call)}_${stamp}.wav`;
+  return `${stateComponent(call)}_${nameComponent(call)}_${date}_${p.hour}-${p.minute}.wav`;
+}
+
+// Contact.address, sanitized exactly like the name component. Missing/empty
+// falls back to the prospect's phone digits, same shape as nameComponent.
+function addressComponent(call: CloudtalkCall): string {
+  const raw = (call.Contact?.address ?? "").trim();
+  if (raw) {
+    const sanitized = raw.replace(/\s+/g, "_").replace(/[^A-Za-z0-9_-]/g, "");
+    if (sanitized) return sanitized;
+  }
+  const digits = (call.Cdr.public_external ?? "").replace(/\D/g, "");
+  return `Unknown_${digits}`;
 }
 
 // Contact.state sanitized like the name. Missing/empty falls back to the literal
