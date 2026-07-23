@@ -10,6 +10,7 @@
   "scripts": {
     "probe": "tsx src/probe.ts",
     "backfill": "tsx src/backfill.ts",
+    "remind": "tsx src/send-reminder.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js"
@@ -18,12 +19,15 @@
     "better-sqlite3": "^11.8.1",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "googleapis": "^144.0.0"
+    "googleapis": "^144.0.0",
+    "node-cron": "^4.6.0",
+    "nodemailer": "^9.0.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/express": "^4.17.21",
     "@types/node": "^20.17.16",
+    "@types/nodemailer": "^8.0.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }

@@ -166,6 +166,95 @@ It pages through the calls index, skips anything already processed, and runs
 each call through the same router and uploader the webhook uses. It sleeps 1s
 between pages to stay under the 60 req/min limit.
 
+## Daily reminder email
+
+Monday through Friday at 6:00 PM `America/New_York`, the service emails Kenneth
+a reminder to review the day's recordings, with links to both Drive roots. It
+runs on an in-process `node-cron` schedule inside this same service, so there is
+no second deployment and no external cron.
+
+The timezone is handled by `node-cron`'s `timezone` option, which resolves the
+offset through `Intl.DateTimeFormat` per fire rather than holding a fixed one,
+so 6 PM stays 6 PM across both DST transitions.
+
+### Setup
+
+The sender is a Gmail account using an **App Password**, not the account
+password. Generate one at <https://myaccount.google.com/apppasswords> (the
+account needs 2FA enabled), then set:
+
+```
+GMAIL_SMTP_USER=            # the sending gmail address, also used as the From
+GMAIL_SMTP_APP_PASSWORD=    # the 16-character app password
+```
+
+Recipients default to the addresses below and only need setting to change them:
+
+```
+KENNETH_EMAIL=kdanna@shoreacrescapital.com          # To:
+ANDREW_EMAIL_CC=amodzelewski@shoreacrescapital.com  # Cc:
+```
+
+The email links to `DRIVE_ROOT_FOLDER_ID` (Jay) and `JOE_DRIVE_ROOT_FOLDER_ID`
+(Joe), so both must be set for the send to succeed.
+
+To point Kenneth straight at Jay's folder instead of the shared root one level
+above it, set the folder id directly:
+
+```
+JAY_DRIVE_FOLDER_ID=        # optional. Jay's folder inside DRIVE_ROOT_FOLDER_ID
+```
+
+Unset, the Jay link falls back to `DRIVE_ROOT_FOLDER_ID`. This is a separate var
+because Jay's subfolder id is not derivable without hardcoding his CloudTalk
+firstname. It only affects the reminder email; call filing still resolves the
+folder itself and is unchanged.
+
+If `GMAIL_SMTP_USER` / `GMAIL_SMTP_APP_PASSWORD` are missing the scheduler does
+not start at all, and logs `reminder_scheduler_disabled` once at boot. That is
+the expected state in local dev.
+
+### Sending a test
+
+Two ways, both send a real email to the real recipients.
+
+A one-off script, run against the deployed environment so it picks up the
+Railway env:
+
+```
+railway run npm run remind
+```
+
+Add `--preview` to print the message and send nothing:
+
+```
+npm run remind -- --preview
+```
+
+Or an HTTP trigger, which is disabled and returns 404 unless
+`ADMIN_TRIGGER_TOKEN` is set to any random string:
+
+```
+ADMIN_TRIGGER_TOKEN=<random string>
+```
+
+```
+curl -X POST https://<your-deploy-host>/admin/send-reminder \
+  -H "x-admin-token: <that same string>"
+```
+
+`{"ok":true}` with 200 means it sent, `{"ok":false}` with 500 means it did not
+and the reason is in the logs.
+
+### Reliability
+
+The reminder is a side feature and is isolated from call archiving. A failed
+send logs `reminder_failed` with the error and is dropped; there is no retry
+beyond the next weekday's run, and nothing in this path can throw into the
+webhook or the uploader. Log lines are the same JSON-per-line format as
+everything else: `reminder_fired`, `reminder_sent`, `reminder_skipped`,
+`reminder_failed`, `reminder_scheduler_started`, `reminder_scheduler_disabled`.
+
 ## Test locally with ngrok
 
 CloudTalk needs a public URL. Point ngrok at the local server:
@@ -213,6 +302,10 @@ src/
   process.ts     one call end to end, shared by webhook and backfill
   db.ts          sqlite init + helpers
   backfill.ts    7-day catch-up script
+  mailer.ts      gmail smtp transport (nodemailer)
+  reminder.ts    the daily reminder email, content + send
+  scheduler.ts   in-process mon-fri 6pm ET schedule
+  send-reminder.ts  one-off manual send, `npm run remind`
   probe.ts       standalone: dump a call's json to confirm field names
   types.ts       shared types
 ```
