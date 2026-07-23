@@ -166,6 +166,56 @@ It pages through the calls index, skips anything already processed, and runs
 each call through the same router and uploader the webhook uses. It sleeps 1s
 between pages to stay under the 60 req/min limit.
 
+Flags:
+
+```
+npm run backfill                       # rolling window: date_from = 7 days ago
+npm run backfill -- --since=2026-07-13 # date_from = midnight Eastern on that date, date_to open
+npm run backfill -- --until=2026-06-04T16:30:00Z  # date_to cutoff, no date_from
+npm run backfill -- --dry-run          # report what WOULD happen, split by resolved agent;
+                                       # downloads nothing, uploads nothing, writes no rows
+```
+
+`--since` and `--until` combine for a closed window. `--since` is read as
+midnight in `America/New_York` (the archive is organized by Eastern date), with
+the offset taken from `Intl` so it is correct on both sides of a DST change.
+
+Dedup uses the `processed_calls` table, so a backfill only re-touches calls that
+were never definitively filed (`skipped_no_disposition` and `failed` rows, plus
+anything never seen). Already-archived rows with a `drive_file_id` are left
+alone. This means it must run where the SQLite volume is mounted; against an
+empty local DB every call looks new and would be re-downloaded and re-filed.
+
+### Backfill over HTTP
+
+To run the backfill inside the deployed service (where the volume is mounted)
+without shell access, there is a token-gated endpoint, same auth as the reminder
+trigger (`ADMIN_TRIGGER_TOKEN`, `x-admin-token` header):
+
+```
+POST /admin/backfill
+```
+
+It takes `since`, `until`, and `dryRun` from the query string or a JSON body.
+**`dryRun` defaults to true** — a real run must be asked for with an explicit
+`dryRun=false`, so a bare call can never download or file anything by accident.
+The response is `{ ok, summary }` where `summary` carries the same counts the
+`--dry-run` CLI logs, including `wouldArchiveByAgent` and
+`wouldArchiveByDisposition`. A live run pages with 1s sleeps and downloads
+recordings, so use a generous client timeout.
+
+```
+# dry run (counts only)
+curl -X POST "https://<your-deploy-host>/admin/backfill?since=2026-07-13" \
+  -H "x-admin-token: <ADMIN_TRIGGER_TOKEN>"
+
+# live run
+curl --max-time 1800 -X POST "https://<your-deploy-host>/admin/backfill" \
+  -H "x-admin-token: <ADMIN_TRIGGER_TOKEN>" \
+  -H "content-type: application/json" \
+  -d '{"since":"2026-07-13","dryRun":false}'
+```
+
 ## Daily reminder email
 
 Monday through Friday at 6:00 PM `America/New_York`, the service emails Kenneth

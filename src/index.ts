@@ -14,6 +14,7 @@ import { getCall, verifySignature } from "./cloudtalk.js";
 import { isProcessed } from "./db.js";
 import { log, processCall } from "./process.js";
 import { runReminderOnce, startReminderScheduler } from "./scheduler.js";
+import { runBackfill } from "./backfill.js";
 import type { CloudtalkCall } from "./types.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -36,24 +37,29 @@ app.get("/health", (_req, res) => {
   res.status(200).json({ ok: true });
 });
 
-// Manual trigger for the daily reminder email, so the send can be tested
-// without waiting for 6 PM. Disabled entirely unless ADMIN_TRIGGER_TOKEN is
-// set, and requires that token in the x-admin-token header. It sends a real
-// email to the real recipients.
-app.post("/admin/send-reminder", (req, res) => {
+// Shared gate for the /admin routes. Returns true if the request is
+// authorized; otherwise it has already written the response (404 when no token
+// is configured, so the endpoint does not exist; 401 on a bad token). Both
+// admin routes reuse ADMIN_TRIGGER_TOKEN.
+function requireAdmin(req: Request, res: express.Response, action: string): boolean {
   const expected = process.env.ADMIN_TRIGGER_TOKEN ?? "";
   if (!expected) {
-    // No token configured means the endpoint does not exist.
     res.status(404).json({ error: "not found" });
-    return;
+    return false;
   }
-
   const provided = req.header("x-admin-token") ?? "";
   if (!tokensMatch(provided, expected)) {
-    log({ level: "warn", action: "reminder_trigger_rejected" });
+    log({ level: "warn", action });
     res.status(401).json({ error: "invalid token" });
-    return;
+    return false;
   }
+  return true;
+}
+
+// Manual trigger for the daily reminder email, so the send can be tested
+// without waiting for 6 PM. It sends a real email to the real recipients.
+app.post("/admin/send-reminder", (req, res) => {
+  if (!requireAdmin(req, res, "reminder_trigger_rejected")) return;
 
   // Awaited so the caller sees the actual result, which is the whole point of
   // a test trigger. runReminderOnce never throws.
@@ -61,6 +67,54 @@ app.post("/admin/send-reminder", (req, res) => {
     res.status(ok ? 200 : 500).json({ ok });
   });
 });
+
+// Manual trigger for the backfill, so it can run in-process where the Railway
+// volume (and thus the dedup DB) is mounted, without railway ssh. Accepts
+// `since` (YYYY-MM-DD) and `until` from either query string or JSON body, and
+// `dryRun` (default TRUE — a real run must be asked for explicitly, so a bare
+// call can never download or file anything by accident). Same dedup, rate
+// limiting, and routing as the CLI.
+app.post("/admin/backfill", (req, res) => {
+  if (!requireAdmin(req, res, "backfill_trigger_rejected")) return;
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const since = pickParam(req, body, "since");
+  const until = pickParam(req, body, "until");
+  const dryRun = parseDryRun(req, body);
+
+  log({ level: "info", action: "backfill_trigger", since, until, dry_run: dryRun });
+
+  // A live run pages through CloudTalk with 1s sleeps and downloads recordings,
+  // so it can take minutes. Respond when it finishes; the caller should use a
+  // generous curl timeout.
+  runBackfill({ since, until, dryRun })
+    .then((summary) => {
+      log({ level: "info", action: "backfill_trigger_complete", dry_run: dryRun });
+      res.status(200).json({ ok: true, summary });
+    })
+    .catch((err) => {
+      const error = err instanceof Error ? err.message : String(err);
+      log({ level: "error", action: "backfill_trigger_failed", error });
+      res.status(500).json({ ok: false, error });
+    });
+});
+
+// Read a string param from the query string first, then the JSON body.
+function pickParam(req: Request, body: Record<string, unknown>, name: string): string | undefined {
+  const q = req.query[name];
+  if (typeof q === "string" && q.length > 0) return q;
+  const b = body[name];
+  if (typeof b === "string" && b.length > 0) return b;
+  return undefined;
+}
+
+// dryRun defaults to true. Only an explicit false (query ?dryRun=false or JSON
+// {"dryRun": false}) opts into a real, downloading-and-filing run.
+function parseDryRun(req: Request, body: Record<string, unknown>): boolean {
+  const raw = req.query.dryRun ?? req.query.dry_run ?? body.dryRun ?? body.dry_run;
+  if (raw === false || raw === "false" || raw === "0") return false;
+  return true;
+}
 
 function tokensMatch(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);

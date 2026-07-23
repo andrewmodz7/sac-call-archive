@@ -1,10 +1,16 @@
-// One-shot backfill. Two modes, both server-side filtered and order-agnostic:
+// One-shot backfill. Server-side filtered and order-agnostic in every mode:
 //
 //   npm run backfill                              -> rolling window: date_from = 7 days ago
 //   npm run backfill -- --until=2026-06-04T16:30:00Z
 //                                                 -> hard cutoff: date_to = the timestamp,
 //                                                    NO date_from, so CloudTalk returns every
 //                                                    call it has up to the cutoff
+//   npm run backfill -- --since=2026-07-13        -> date_from = midnight Eastern on that date,
+//                                                    date_to left open (i.e. up to now)
+//   --since and --until can be combined for a closed window.
+//   --dry-run                                     -> page through and report what WOULD happen,
+//                                                    broken down by resolved agent. Downloads
+//                                                    nothing, uploads nothing, writes no rows.
 //
 // Runs any call not definitively done through the same router and uploader as
 // the webhook. "Definitively done" = archived with a Drive file id, or skipped
@@ -20,14 +26,11 @@
 // Rate limit is 60 req/min, so sleep 1s between pages.
 
 import "dotenv/config";
+import { pathToFileURL } from "node:url";
 import { buildListCallsUrl, listCalls, type ListCallsFilters } from "./cloudtalk.js";
 import { getProcessed, type ProcessedRow } from "./db.js";
 import { log, processCall } from "./process.js";
-
-// TODO(diagnostic): temporary instrumentation for the missing-call
-// investigation (call 1207821971 confirmed tagged + inside the date_to window
-// by direct curl, yet absent from backfill output). Remove once root-caused.
-const TEST_CALL_ID = "1207821971";
+import { resolveAgentIdentity, routeCall } from "./router.js";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const PAGE_LIMIT = 1000; // CloudTalk supports up to 1000 per page
@@ -96,33 +99,131 @@ async function pickDateTo(cutoffMs: number, candidates: string[]): Promise<strin
   return fallback;
 }
 
-async function buildFilters(): Promise<ListCallsFilters> {
-  const untilArg = process.argv
+function argValue(name: string): string | undefined {
+  const prefix = `--${name}=`;
+  return process.argv
     .slice(2)
-    .find((a) => a.startsWith("--until="))
-    ?.slice("--until=".length);
+    .find((a) => a.startsWith(prefix))
+    ?.slice(prefix.length);
+}
 
-  if (!untilArg) {
+// UTC offset in minutes for America/New_York at a given instant, read from Intl
+// rather than hardcoded, so it is correct on both sides of a DST change. Same
+// approach as easternParts in router.ts.
+function easternOffsetMinutes(at: Date): number {
+  const name =
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      timeZoneName: "longOffset",
+    })
+      .formatToParts(at)
+      .find((p) => p.type === "timeZoneName")?.value ?? "GMT+00:00";
+  const m = /GMT([+-])(\d{2}):(\d{2})/.exec(name);
+  if (!m) return 0;
+  const sign = m[1] === "-" ? -1 : 1;
+  return sign * (Number(m[2]) * 60 + Number(m[3]));
+}
+
+// Midnight Eastern on a YYYY-MM-DD, as a UTC instant. The archive is organized
+// by Eastern date, so --since=2026-07-13 means the start of July 13 Eastern.
+// Reading it as 00:00 UTC would reach back into the evening of July 12.
+function easternMidnightIso(day: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    throw new Error(`--since must be YYYY-MM-DD: ${day}`);
+  }
+  const baseMs = Date.parse(`${day}T00:00:00Z`);
+  if (Number.isNaN(baseMs)) throw new Error(`--since is not a valid date: ${day}`);
+  // Sample the offset at midday, safely clear of the 2 AM DST transitions.
+  const offsetMin = easternOffsetMinutes(new Date(`${day}T12:00:00Z`));
+  return new Date(baseMs - offsetMin * 60_000).toISOString();
+}
+
+async function buildFilters(sinceArg?: string, untilArg?: string): Promise<ListCallsFilters> {
+  if (!sinceArg && !untilArg) {
     // Default: rolling 7-day window, as before.
     return { dateFrom: new Date(Date.now() - SEVEN_DAYS_MS).toISOString() };
   }
 
-  const cutoff = new Date(untilArg);
-  if (Number.isNaN(cutoff.getTime())) {
-    throw new Error(`--until is not a parseable timestamp: ${untilArg}`);
+  const filters: ListCallsFilters = {};
+
+  if (sinceArg) {
+    filters.dateFrom = easternMidnightIso(sinceArg);
+    log({
+      level: "info",
+      msg: "backfill since mode",
+      since: sinceArg,
+      date_from: filters.dateFrom,
+      note: "date_to left open",
+    });
   }
 
-  const isoUtc = cutoff.toISOString().slice(0, 19); // YYYY-MM-DDTHH:MM:SS
-  const dateTo = await pickDateTo(cutoff.getTime(), [
-    `${isoUtc}Z`, // ISO 8601 with T
-    isoUtc.replace("T", " "), // docs format: "2017-12-24 12:22:00"
-  ]);
-  log({ level: "info", msg: "backfill cutoff mode", until: untilArg, date_to: dateTo });
-  return { dateTo };
+  if (untilArg) {
+    const cutoff = new Date(untilArg);
+    if (Number.isNaN(cutoff.getTime())) {
+      throw new Error(`--until is not a parseable timestamp: ${untilArg}`);
+    }
+    const isoUtc = cutoff.toISOString().slice(0, 19); // YYYY-MM-DDTHH:MM:SS
+    filters.dateTo = await pickDateTo(cutoff.getTime(), [
+      `${isoUtc}Z`, // ISO 8601 with T
+      isoUtc.replace("T", " "), // docs format: "2017-12-24 12:22:00"
+    ]);
+    log({ level: "info", msg: "backfill cutoff mode", until: untilArg, date_to: filters.dateTo });
+  }
+
+  return filters;
 }
 
-async function main(): Promise<void> {
-  const filters = await buildFilters();
+// Dry-run accounting. Counts what a real run would do, without downloading,
+// uploading, or writing a row.
+type Tally = Record<string, number>;
+
+function bump(t: Tally, key: string): void {
+  t[key] = (t[key] ?? 0) + 1;
+}
+
+export interface BackfillOptions {
+  since?: string; // YYYY-MM-DD, date_from at midnight Eastern
+  until?: string; // parseable timestamp, date_to
+  dryRun?: boolean;
+}
+
+// Machine-readable result, so callers (the HTTP trigger) can return it as JSON
+// instead of only emitting log lines.
+export interface BackfillSummary {
+  dryRun: boolean;
+  candidates: number; // rows that were not already definitively done
+  processed: number;
+  archived: number;
+  failed: number;
+  alreadyDone: number;
+  retriedNoDisposition: number;
+  wouldArchiveTotal: number;
+  wouldArchiveByAgent: Tally;
+  wouldArchiveByDisposition: Tally;
+  wouldSkipByAction: Tally;
+  unrecognizedTags: Tally;
+  pagesRead: number;
+  oldestSeenCall: string | null;
+  newestSeenCall: string | null;
+}
+
+// The whole run, parameterized. Shared verbatim by the CLI and the HTTP
+// trigger so both behave identically. Rate limiting, dedup via
+// isDefinitivelyDone, and tag-poll-disabled behavior are unchanged.
+export async function runBackfill(options: BackfillOptions = {}): Promise<BackfillSummary> {
+  const dryRun = options.dryRun === true;
+  const filters = await buildFilters(options.since, options.until);
+
+  if (dryRun) {
+    log({ level: "info", msg: "DRY RUN: no downloads, no uploads, no rows written" });
+  }
+
+  // Dry-run tallies.
+  const wouldArchiveByAgent: Tally = {};
+  const wouldArchiveByDisposition: Tally = {};
+  const wouldSkipByAction: Tally = {};
+  const unrecognizedTags: Tally = {};
+  let wouldArchiveTotal = 0;
 
   let page = 1;
   let pageCount = 1;
@@ -137,10 +238,9 @@ async function main(): Promise<void> {
   let oldestMs = Infinity;
   let newestMs = -Infinity;
 
-  // Diagnostic accounting: every id the API returned, every id the loop
-  // actually iterated, and every request URL — so a missing call is provably
-  // either absent from the responses or dropped by our own code.
-  const requestUrls: string[] = [];
+  // Diagnostic accounting: every id the API returned and every id the loop
+  // actually iterated, so a missing call is provably either absent from the
+  // responses or dropped by our own code.
   const receivedIds: string[] = [];
   const iteratedIds = new Set<string>();
   let itemsIterated = 0;
@@ -148,7 +248,6 @@ async function main(): Promise<void> {
   do {
     const url = buildListCallsUrl(page, PAGE_LIMIT, filters);
     log({ level: "info", msg: "fetching page", url, page, limit: PAGE_LIMIT });
-    requestUrls.push(url);
 
     const rd = await listCalls(page, PAGE_LIMIT, filters);
     pageCount = rd.pageCount || 1;
@@ -190,6 +289,24 @@ async function main(): Promise<void> {
       }
       if (existing?.action === "skipped_no_disposition") retriedNoDisposition++;
 
+      if (dryRun) {
+        // Same pure decisions the real run makes, minus the IO.
+        const agent = resolveAgentIdentity(call.Agent?.firstname) ?? "(no agent)";
+        const route = routeCall(call);
+        if (route.kind === "archive") {
+          wouldArchiveTotal++;
+          bump(wouldArchiveByAgent, agent);
+          bump(wouldArchiveByDisposition, `${agent} / ${route.disposition}`);
+        } else {
+          bump(wouldSkipByAction, route.action);
+          if (route.action === "skipped_no_disposition") {
+            for (const tag of route.tagNames) bump(unrecognizedTags, tag);
+          }
+        }
+        processed++;
+        continue;
+      }
+
       const outcome = await processCall(call);
       processed++;
       if (outcome.action === "archived") archived++;
@@ -227,13 +344,41 @@ async function main(): Promise<void> {
     });
   }
 
-  // Diagnostic: the known-tagged test call must show up in some page's items.
-  if (!receivedIds.includes(TEST_CALL_ID)) {
+  const summary: BackfillSummary = {
+    dryRun,
+    candidates: processed,
+    processed,
+    archived,
+    failed,
+    alreadyDone,
+    retriedNoDisposition,
+    wouldArchiveTotal,
+    wouldArchiveByAgent,
+    wouldArchiveByDisposition,
+    wouldSkipByAction,
+    unrecognizedTags,
+    pagesRead,
+    oldestSeenCall,
+    newestSeenCall,
+  };
+
+  if (dryRun) {
     log({
-      level: "error",
-      msg: `call ${TEST_CALL_ID} missing from all pages despite being within cutoff window`,
-      request_urls: requestUrls,
+      level: "info",
+      msg: "DRY RUN complete: nothing downloaded, uploaded, or written",
+      candidates: processed,
+      alreadyDone,
+      retriedNoDisposition,
+      would_archive_total: wouldArchiveTotal,
+      would_archive_by_agent: wouldArchiveByAgent,
+      would_archive_by_disposition: wouldArchiveByDisposition,
+      would_skip_by_action: wouldSkipByAction,
+      unrecognized_tags: unrecognizedTags,
+      pagesRead,
+      oldestSeenCall,
+      newestSeenCall,
     });
+    return summary;
   }
 
   log({
@@ -248,13 +393,30 @@ async function main(): Promise<void> {
     oldestSeenCall,
     newestSeenCall,
   });
+  return summary;
 }
 
-main().catch((err) => {
-  log({
-    level: "error",
-    msg: "backfill crashed",
-    error: err instanceof Error ? err.message : String(err),
+// CLI entry. Only runs when this file is executed directly (npm run backfill),
+// not when index.ts imports runBackfill for the HTTP trigger.
+async function cli(): Promise<void> {
+  await runBackfill({
+    since: argValue("since"),
+    until: argValue("until"),
+    dryRun: process.argv.slice(2).includes("--dry-run"),
   });
-  process.exit(1);
-});
+}
+
+const isDirectRun =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) {
+  cli().catch((err) => {
+    log({
+      level: "error",
+      msg: "backfill crashed",
+      error: err instanceof Error ? err.message : String(err),
+    });
+    process.exit(1);
+  });
+}
