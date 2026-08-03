@@ -218,14 +218,38 @@ curl --max-time 1800 -X POST "https://<your-deploy-host>/admin/backfill" \
 
 ## Daily reminder email
 
-Monday through Friday at 6:00 PM `America/New_York`, the service emails Kenneth
-a reminder to review the day's recordings, with links to both Drive roots. It
-runs on an in-process `node-cron` schedule inside this same service, so there is
-no second deployment and no external cron.
+Monday through Friday at 8:00 PM `America/New_York`, the service emails Kenneth
+a reminder to review the day's recordings, with links to both Drive roots and
+the day's call counts for Jay and Joe. It runs on an in-process `node-cron`
+schedule inside this same service, so there is no second deployment and no
+external cron.
 
 The timezone is handled by `node-cron`'s `timezone` option, which resolves the
 offset through `Intl.DateTimeFormat` per fire rather than holding a fixed one,
-so 6 PM stays 6 PM across both DST transitions.
+so 8 PM stays 8 PM across both DST transitions.
+
+### Call counts
+
+Just before each send, the reminder pulls the day's calls straight from the
+CloudTalk call list (`calls/index.json`, filtered to `date_from` = midnight
+Eastern today) and counts them by resolved agent identity, so Frank's seat is
+attributed to Joe exactly as call filing does it. This reads CloudTalk directly
+rather than the local `processed_calls` table on purpose: many calls never get
+archived (missing dispositions), so that table would badly undercount volume.
+
+From that same single pull the email also shows, per agent, a full disposition
+breakdown for the day: every disposition with at least one call, sorted highest
+count first, with no cap and no "Other" rollup. Each call counts once (its first
+CloudTalk tag), so an agent's breakdown sums to their total. A call with no tag
+at all is counted under `No Disposition` rather than dropped, because that number
+is itself meaningful given the known tag-marking gaps. An agent with no calls
+shows `0 calls` and no list.
+
+The count is read-only and strictly best-effort. It downloads nothing, writes no
+row, and touches no Drive folder, and if the CloudTalk fetch (or the breakdown
+computation) fails it logs `reminder_call_counts_failed` and the email still
+sends with a `count unavailable` note in place of the numbers. It can never block
+or break the send.
 
 ### Setup
 
@@ -303,7 +327,8 @@ send logs `reminder_failed` with the error and is dropped; there is no retry
 beyond the next weekday's run, and nothing in this path can throw into the
 webhook or the uploader. Log lines are the same JSON-per-line format as
 everything else: `reminder_fired`, `reminder_sent`, `reminder_skipped`,
-`reminder_failed`, `reminder_scheduler_started`, `reminder_scheduler_disabled`.
+`reminder_failed`, `reminder_call_counts_failed`, `reminder_scheduler_started`,
+`reminder_scheduler_disabled`.
 
 ## Test locally with ngrok
 
@@ -354,7 +379,8 @@ src/
   backfill.ts    7-day catch-up script
   mailer.ts      gmail smtp transport (nodemailer)
   reminder.ts    the daily reminder email, content + send
-  scheduler.ts   in-process mon-fri 6pm ET schedule
+  call-counts.ts read-only daily call counts from cloudtalk, by resolved agent
+  scheduler.ts   in-process mon-fri 8pm ET schedule
   send-reminder.ts  one-off manual send, `npm run remind`
   probe.ts       standalone: dump a call's json to confirm field names
   types.ts       shared types

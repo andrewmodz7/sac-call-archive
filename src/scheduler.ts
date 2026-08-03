@@ -3,7 +3,7 @@
 //
 // node-cron resolves the timezone through Intl.DateTimeFormat with
 // timeZoneName: "shortOffset", so it recomputes the UTC offset per fire rather
-// than holding a fixed one. 6:00 PM Eastern stays 6:00 PM Eastern across both
+// than holding a fixed one. 8:00 PM Eastern stays 8:00 PM Eastern across both
 // DST transitions. (Nothing lands in a DST gap either way: the transitions
 // happen at 2 AM.)
 
@@ -12,8 +12,8 @@ import { isMailConfigured } from "./mailer.js";
 import { log } from "./process.js";
 import { sendReviewReminder } from "./reminder.js";
 
-// Minute 0, hour 18, Monday through Friday.
-export const REMINDER_CRON = "0 18 * * 1-5";
+// Minute 0, hour 20, Monday through Friday.
+export const REMINDER_CRON = "0 20 * * 1-5";
 export const REMINDER_TIMEZONE = "America/New_York";
 
 // Run the reminder once and log the outcome. Never throws: this is a side

@@ -57,7 +57,7 @@ function requireAdmin(req: Request, res: express.Response, action: string): bool
 }
 
 // Manual trigger for the daily reminder email, so the send can be tested
-// without waiting for 6 PM. It sends a real email to the real recipients.
+// without waiting for 8 PM. It sends a real email to the real recipients.
 app.post("/admin/send-reminder", (req, res) => {
   if (!requireAdmin(req, res, "reminder_trigger_rejected")) return;
 

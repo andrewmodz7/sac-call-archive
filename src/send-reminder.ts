@@ -1,8 +1,9 @@
 // One-off manual send of the reminder email. Run with `npm run remind`.
 //
-// Use this to test the SMTP credentials without waiting for 6 PM. It sends a
+// Use this to test the SMTP credentials without waiting for 8 PM. It sends a
 // real email to the real recipients, so it is not a dry run. To see what would
-// be sent without sending it, pass --preview.
+// be sent without sending it, pass --preview. Preview pulls the real CloudTalk
+// call counts (read-only) so you see the exact body that would go out.
 //
 // On Railway (where the credentials live), run it against the deployed env:
 //   railway run npm run remind
@@ -10,14 +11,16 @@
 import "dotenv/config";
 import { isMailConfigured } from "./mailer.js";
 import { log } from "./process.js";
-import { buildReminder, reminderCc, reminderTo } from "./reminder.js";
+import { buildReminder, fetchCallCountsSafe, reminderCc, reminderTo } from "./reminder.js";
 import { runReminderOnce } from "./scheduler.js";
 
 async function main(): Promise<void> {
   const preview = process.argv.slice(2).includes("--preview");
 
   if (preview) {
-    const { subject, text } = buildReminder(new Date());
+    const now = new Date();
+    const counts = await fetchCallCountsSafe(now);
+    const { subject, text } = buildReminder(now, counts);
     console.log(`To:      ${reminderTo()}`);
     console.log(`Cc:      ${reminderCc()}`);
     console.log(`Subject: ${subject}`);
