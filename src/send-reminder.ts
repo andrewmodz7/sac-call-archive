@@ -11,7 +11,7 @@
 import "dotenv/config";
 import { isMailConfigured } from "./mailer.js";
 import { log } from "./process.js";
-import { buildReminder, fetchCallCountsSafe, reminderCc, reminderTo } from "./reminder.js";
+import { buildReminder, fetchCallCountsSafe, fetchFolderLinksSafe, reminderCc, reminderTo } from "./reminder.js";
 import { runReminderOnce } from "./scheduler.js";
 
 async function main(): Promise<void> {
@@ -20,7 +20,8 @@ async function main(): Promise<void> {
   if (preview) {
     const now = new Date();
     const counts = await fetchCallCountsSafe(now);
-    const { subject, text } = buildReminder(now, counts);
+    const links = counts ? await fetchFolderLinksSafe(counts, now) : {};
+    const { subject, text } = buildReminder(now, counts, links);
     console.log(`To:      ${reminderTo()}`);
     console.log(`Cc:      ${reminderCc()}`);
     console.log(`Subject: ${subject}`);

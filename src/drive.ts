@@ -105,6 +105,39 @@ export async function resolveFolderPath(
   return parentId;
 }
 
+// Read-only counterpart to resolveFolderPath: walks the same segment path,
+// reusing the same cache, but never creates a missing folder. Returns
+// undefined the moment any segment in the path doesn't exist yet, rather than
+// materializing it — used by the reminder email, which must never leave an
+// empty folder behind just because it asked about a disposition that hasn't
+// been archived yet today. A full-path hit is still written to folder_cache,
+// since that lookup is exactly as valid to reuse as one from archiving.
+export async function findFolderReadOnly(
+  segments: string[],
+  rootEnvVar = "DRIVE_ROOT_FOLDER_ID",
+): Promise<string | undefined> {
+  const rootId = rootFolderId(rootEnvVar);
+  let parentId = rootId;
+  let pathKey = rootId;
+
+  for (const segment of segments) {
+    pathKey = `${pathKey}/${segment}`;
+
+    const cached = getCachedFolder(pathKey);
+    if (cached) {
+      parentId = cached;
+      continue;
+    }
+
+    const existing = await findChildFolder(parentId, segment);
+    if (!existing) return undefined;
+    cacheFolder(pathKey, existing);
+    parentId = existing;
+  }
+
+  return parentId;
+}
+
 export async function uploadMp3(args: {
   folderId: string;
   filename: string;

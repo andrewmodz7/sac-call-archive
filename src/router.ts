@@ -73,6 +73,15 @@ function archiveDispositions(agent: string | null): Record<string, string> {
   return isJoe(agent) ? JOE_ARCHIVE_DISPOSITIONS : JAY_ARCHIVE_DISPOSITIONS;
 }
 
+// Folder name for a disposition tag, if this agent archives it — the same
+// mapping routeCall uses, exposed so the reminder email can resolve a
+// disposition's Drive folder without duplicating (or drifting from) the
+// slash-sanitization above. Undefined means the tag is skipped or
+// unrecognized: no folder was ever going to exist for it.
+export function archiveFolderName(agent: string | null, dispositionTagName: string): string | undefined {
+  return archiveDispositions(agent)[dispositionTagName];
+}
+
 // Dispositions we recognize but intentionally do not archive, for every agent.
 // "No Answer" stays here deliberately for both Jay and Joe: it is never
 // downloaded and never filed, whatever other reference material may suggest.
@@ -159,10 +168,11 @@ function easternParts(iso: string): LocalParts {
   };
 }
 
-// Month folder, YYYY-MM so it sorts naturally.
-export function monthFolder(startedAt: string): string {
+// Day folder, MM-DD-YYYY. Merged directly into the disposition segment below
+// (not a separate path level), so each disposition gets one folder per day.
+export function dayFolder(startedAt: string): string {
   const p = easternParts(startedAt);
-  return `${p.year}-${p.month}`;
+  return `${p.month}-${p.day}-${p.year}`;
 }
 
 // --- Drive location ---------------------------------------------------------
@@ -174,17 +184,20 @@ export function driveRootEnvVar(agent: string | null): string {
 }
 
 // Folder segments beneath that root.
-//   Jay (and any other agent): {Agent}/{Disposition}/{YYYY-MM}  — unchanged
-//   Joe:                       {Disposition}/{YYYY-MM}          — his root is
+//   Jay (and any other agent): {Agent}/{Disposition MM-DD-YYYY}
+//   Joe:                       {Disposition MM-DD-YYYY}   — his root is
 //                              already agent-specific, so no agent level.
+// Disposition and date are merged into a single segment (rather than nested
+// disposition-then-month levels) so a day's recordings for a disposition live
+// in one folder the reminder email can link to directly.
 export function folderSegments(
   agent: string | null,
   folderName: string,
   startedAt: string,
 ): string[] {
-  const month = monthFolder(startedAt);
-  if (isJoe(agent)) return [folderName, month];
-  return [agent ?? "Unknown Agent", folderName, month];
+  const dispositionDay = `${folderName} ${dayFolder(startedAt)}`;
+  if (isJoe(agent)) return [dispositionDay];
+  return [agent ?? "Unknown Agent", dispositionDay];
 }
 
 // --- Filenames --------------------------------------------------------------

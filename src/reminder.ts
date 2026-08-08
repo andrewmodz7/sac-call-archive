@@ -4,10 +4,18 @@
 // is built with string concatenation, not a template engine, so there is only
 // one way this email gets assembled.
 
-import { countTodaysCallsByAgent, type CallCounts } from "./call-counts.js";
+import { countTodaysCallsByAgent, NO_DISPOSITION, type CallCounts } from "./call-counts.js";
+import { findFolderReadOnly } from "./drive.js";
 import { sendMail } from "./mailer.js";
 import { log } from "./process.js";
-import { JOE, monthFolder } from "./router.js";
+import { archiveFolderName, driveRootEnvVar, folderSegments, JOE } from "./router.js";
+
+// Per (agent, disposition) with at least one call today: the Drive folder id
+// if one already exists (string), null if the disposition is archived but no
+// folder has been created yet today, or the key is simply absent if this
+// disposition is never archived for this agent (e.g. "No Answer") — nothing
+// was ever going to exist there, so no lookup is attempted.
+type FolderLinks = Record<string, Record<string, string | null>>;
 
 // Recipients are env vars with the known-good addresses as defaults, so a
 // change is a Railway env edit rather than a deploy.
@@ -63,6 +71,7 @@ interface AgentCallView {
   label: string;
   total: number;
   dispositions: Array<[string, number]>; // [name, count], sorted count desc
+  folderLinks: Record<string, string | null>; // disposition name -> folder id, see FolderLinks
 }
 
 // Merge the disposition maps of a set of resolved agents into one, then sort
@@ -82,15 +91,116 @@ function mergedDispositions(counts: CallCounts, wantJoe: boolean): Array<[string
   return Object.entries(merged).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
+// Same split as mergedDispositions, applied to the folder-link results instead
+// of the counts, so each view's disposition list and its links come from the
+// same agent partition. A disposition present under more than one raw agent
+// (not expected today, but not structurally impossible) prefers whichever
+// resolved an actual folder id over a still-pending one.
+function mergedFolderLinks(links: FolderLinks, counts: CallCounts, wantJoe: boolean): Record<string, string | null> {
+  const merged: Record<string, string | null> = {};
+  for (const agent of Object.keys(counts.dispositionsByAgent)) {
+    if ((agent === JOE) !== wantJoe) continue;
+    for (const [name, folderId] of Object.entries(links[agent] ?? {})) {
+      if (merged[name] === undefined || folderId) merged[name] = folderId;
+    }
+  }
+  return merged;
+}
+
 // Jay's and Joe's views for the day. Joe's total is his own resolved count and
 // Jay's is "everything else" (total minus Joe), matching how mergedDispositions
 // splits the per-disposition maps, so each agent's breakdown sums to their total.
-function agentViews(counts: CallCounts): AgentCallView[] {
+function agentViews(counts: CallCounts, links: FolderLinks): AgentCallView[] {
   const joeTotal = counts.byAgent[JOE] ?? 0;
   return [
-    { label: "Jay", total: counts.total - joeTotal, dispositions: mergedDispositions(counts, false) },
-    { label: "Joe", total: joeTotal, dispositions: mergedDispositions(counts, true) },
+    {
+      label: "Jay",
+      total: counts.total - joeTotal,
+      dispositions: mergedDispositions(counts, false),
+      folderLinks: mergedFolderLinks(links, counts, false),
+    },
+    {
+      label: "Joe",
+      total: joeTotal,
+      dispositions: mergedDispositions(counts, true),
+      folderLinks: mergedFolderLinks(links, counts, true),
+    },
   ];
+}
+
+// For each (agent, disposition) with at least one call today, resolve the
+// Drive folder id if one already exists. Segments and root env var are built
+// with the exact same router functions the archiver uses (folderSegments,
+// driveRootEnvVar, archiveFolderName), so a hit lands on the folder_cache row
+// archiving itself already wrote today and costs no extra Drive API call.
+// A disposition this agent never archives (e.g. "No Answer") is skipped
+// outright — no folder was ever going to exist for it. A single lookup
+// failure degrades just that entry to "pending" rather than losing every
+// link; fetchFolderLinksSafe is the outer guard against anything unexpected.
+async function findDispositionFolderLinks(counts: CallCounts, now: Date): Promise<FolderLinks> {
+  const startedAt = now.toISOString();
+  const links: FolderLinks = {};
+
+  for (const [agent, byDisposition] of Object.entries(counts.dispositionsByAgent)) {
+    for (const [disposition, count] of Object.entries(byDisposition)) {
+      if (count < 1 || disposition === NO_DISPOSITION) continue;
+
+      const folderName = archiveFolderName(agent, disposition);
+      if (!folderName) continue;
+
+      const segments = folderSegments(agent, folderName, startedAt);
+      let folderId: string | undefined;
+      try {
+        folderId = await findFolderReadOnly(segments, driveRootEnvVar(agent));
+      } catch (err) {
+        log({
+          level: "warn",
+          action: "reminder_folder_lookup_failed",
+          agent,
+          disposition,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        folderId = undefined;
+      }
+      (links[agent] ??= {})[disposition] = folderId ?? null;
+    }
+  }
+
+  return links;
+}
+
+// Never-block-the-send wrapper, same pattern as fetchCallCountsSafe: any
+// unexpected failure (auth, network, a bug in the lookup) is logged and
+// swallowed, degrading every disposition line to plain text rather than
+// blocking the send or throwing out of buildReminder.
+export async function fetchFolderLinksSafe(counts: CallCounts, now: Date): Promise<FolderLinks> {
+  try {
+    return await findDispositionFolderLinks(counts, now);
+  } catch (err) {
+    log({
+      level: "error",
+      action: "reminder_folder_links_failed",
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return {};
+  }
+}
+
+// One disposition line, plain-text part. Three states: a resolved folder id
+// gets a link, `null` (archived disposition, folder not created yet) gets a
+// note, and an absent entry (never archived, e.g. "No Answer") gets neither.
+function dispositionLineText(name: string, n: number, folderId: string | null | undefined): string {
+  if (folderId) return `  - ${name}: ${n} - ${folderLink(folderId)}`;
+  if (folderId === null) return `  - ${name}: ${n} (folder not yet available)`;
+  return `  - ${name}: ${n}`;
+}
+
+// Same three states for the HTML part.
+function dispositionLineHtml(name: string, n: number, folderId: string | null | undefined): string {
+  const escaped = escapeHtml(name);
+  if (folderId) return `<a href="${folderLink(folderId)}">${escaped}</a>: ${n}`;
+  if (folderId === null) return `${escaped}: ${n} (folder not yet available)`;
+  return `${escaped}: ${n}`;
 }
 
 // The plain-text "calls made today" block: per agent, the total then the full
@@ -98,12 +208,14 @@ function agentViews(counts: CallCounts): AgentCallView[] {
 // shows "0 calls" and no list. `null` means the CloudTalk fetch failed; per the
 // never-block-the-send rule the email still goes out, with a short unavailable
 // note instead of numbers.
-function callCountTextLines(counts: CallCounts | null): string[] {
+function callCountTextLines(counts: CallCounts | null, links: FolderLinks): string[] {
   if (!counts) return ["Calls made today: count unavailable"];
   const lines = ["Calls made today:"];
-  for (const view of agentViews(counts)) {
+  for (const view of agentViews(counts, links)) {
     lines.push("", `${view.label}: ${view.total} calls`);
-    for (const [name, n] of view.dispositions) lines.push(`  - ${name}: ${n}`);
+    for (const [name, n] of view.dispositions) {
+      lines.push(dispositionLineText(name, n, view.folderLinks[name]));
+    }
   }
   return lines;
 }
@@ -111,15 +223,15 @@ function callCountTextLines(counts: CallCounts | null): string[] {
 // Same block for the HTML part: each agent's breakdown is a <ul> so it renders
 // as an indented list in Gmail. Disposition names come from the CloudTalk API,
 // so they are HTML-escaped before interpolation.
-function callCountHtmlLines(counts: CallCounts | null): string[] {
+function callCountHtmlLines(counts: CallCounts | null, links: FolderLinks): string[] {
   if (!counts) return ["<p>Calls made today: count unavailable</p>"];
   const lines = ["<p>Calls made today:</p>"];
-  for (const view of agentViews(counts)) {
+  for (const view of agentViews(counts, links)) {
     lines.push(`<p>${view.label}: ${view.total} calls</p>`);
     if (view.dispositions.length > 0) {
       lines.push("<ul>");
       for (const [name, n] of view.dispositions) {
-        lines.push(`<li>${escapeHtml(name)}: ${n}</li>`);
+        lines.push(`<li>${dispositionLineHtml(name, n, view.folderLinks[name])}</li>`);
       }
       lines.push("</ul>");
     }
@@ -141,15 +253,18 @@ export interface ReminderContent {
 }
 
 // `counts` is the day's call totals from CloudTalk, or null if the fetch failed
-// (the send is never blocked on it). Defaults to null so a caller that only
-// wants the recordings body can omit it.
-export function buildReminder(now: Date, counts: CallCounts | null = null): ReminderContent {
+// (the send is never blocked on it). `links` is the day's per-disposition
+// folder ids, or {} if that lookup failed or was skipped (no counts to drive
+// it). Both default so a caller that only wants the recordings body can omit
+// them.
+export function buildReminder(
+  now: Date,
+  counts: CallCounts | null = null,
+  links: FolderLinks = {},
+): ReminderContent {
   const jayLink = folderLink(jayFolderId());
   const joeLink = folderLink(requireEnv("JOE_DRIVE_ROOT_FOLDER_ID"));
   const date = displayDate(now);
-  // Reuse the router's month folder so the email names the same folder the
-  // uploader just wrote into.
-  const month = monthFolder(now.toISOString());
 
   const text = [
     "Kenneth,",
@@ -159,9 +274,9 @@ export function buildReminder(now: Date, counts: CallCounts | null = null): Remi
     `Jay: ${jayLink}`,
     `Joe: ${joeLink}`,
     "",
-    `Both are organized by disposition, then by month (${month}).`,
+    "Both are organized by disposition, then by day. Each disposition below links straight to today's folder once at least one call has been filed there.",
     "",
-    ...callCountTextLines(counts),
+    ...callCountTextLines(counts, links),
     "",
     `Date: ${date}`,
     "",
@@ -176,8 +291,8 @@ export function buildReminder(now: Date, counts: CallCounts | null = null): Remi
     `Jay: <a href="${jayLink}">${jayLink}</a><br>`,
     `Joe: <a href="${joeLink}">${joeLink}</a>`,
     "</p>",
-    `<p>Both are organized by disposition, then by month (${month}).</p>`,
-    ...callCountHtmlLines(counts),
+    "<p>Both are organized by disposition, then by day. Each disposition below links straight to today's folder once at least one call has been filed there.</p>",
+    ...callCountHtmlLines(counts, links),
     `<p>Date: ${date}</p>`,
   ].join("\n");
 
@@ -217,7 +332,12 @@ export async function sendReviewReminder(now: Date = new Date()): Promise<Remind
   // CloudTalk hiccup degrades the email to "count unavailable" instead of
   // blocking the send.
   const counts = await fetchCallCountsSafe(now);
-  const { subject, text, html } = buildReminder(now, counts);
+  // Folder links need the day's dispositions to know what to look up, so this
+  // only runs when counts came back. fetchFolderLinksSafe never throws, so a
+  // Drive hiccup degrades every disposition line to plain text instead of
+  // blocking the send.
+  const links = counts ? await fetchFolderLinksSafe(counts, now) : {};
+  const { subject, text, html } = buildReminder(now, counts, links);
 
   const messageId = await sendMail({ to, cc, subject, text, html });
   return { to, cc, subject, message_id: messageId };
