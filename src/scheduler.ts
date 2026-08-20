@@ -10,7 +10,7 @@
 import cron from "node-cron";
 import { isMailConfigured } from "./mailer.js";
 import { log } from "./process.js";
-import { sendReviewReminder } from "./reminder.js";
+import { sendJoeReminder, sendReviewReminder } from "./reminder.js";
 
 // Minute 0, hour 20, Monday through Friday.
 export const REMINDER_CRON = "0 20 * * 1-5";
@@ -60,7 +60,52 @@ export async function runReminderOnce(trigger: string): Promise<boolean> {
   }
 }
 
-// Register the schedule. Call once at startup.
+// Run Joe's reminder once and log the outcome. Same never-block-anything
+// contract as runReminderOnce, kept as its own function (rather than folded
+// into runReminderOnce) so a failure on one job never affects the other and
+// so the two are distinguishable in logs by action name. Returns whether the
+// send succeeded, for the manual trigger.
+export async function runJoeReminderOnce(trigger: string): Promise<boolean> {
+  const start = Date.now();
+  log({ level: "info", action: "joe_reminder_fired", trigger });
+
+  if (!isMailConfigured()) {
+    log({
+      level: "warn",
+      action: "joe_reminder_skipped",
+      trigger,
+      reason: "GMAIL_SMTP_USER / GMAIL_SMTP_APP_PASSWORD not set",
+    });
+    return false;
+  }
+
+  try {
+    const result = await sendJoeReminder();
+    log({
+      level: "info",
+      action: "joe_reminder_sent",
+      trigger,
+      to: result.to,
+      subject: result.subject,
+      message_id: result.message_id,
+      duration_ms: Date.now() - start,
+    });
+    return true;
+  } catch (err) {
+    // Logged and dropped on purpose, same as runReminderOnce: the next
+    // weekday run is the retry.
+    log({
+      level: "error",
+      action: "joe_reminder_failed",
+      trigger,
+      error: err instanceof Error ? err.message : String(err),
+      duration_ms: Date.now() - start,
+    });
+    return false;
+  }
+}
+
+// Register both schedules. Call once at startup.
 export function startReminderScheduler(): void {
   if (!isMailConfigured()) {
     // Not an error. Local dev has no SMTP credentials, and firing a failing
@@ -74,6 +119,9 @@ export function startReminderScheduler(): void {
   }
 
   cron.schedule(REMINDER_CRON, () => void runReminderOnce("schedule"), {
+    timezone: REMINDER_TIMEZONE,
+  });
+  cron.schedule(REMINDER_CRON, () => void runJoeReminderOnce("schedule"), {
     timezone: REMINDER_TIMEZONE,
   });
 

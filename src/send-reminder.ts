@@ -5,25 +5,37 @@
 // be sent without sending it, pass --preview. Preview pulls the real CloudTalk
 // call counts (read-only) so you see the exact body that would go out.
 //
+// Pass --joe to target Joe's summary instead of Kenneth's, in either mode.
+//
 // On Railway (where the credentials live), run it against the deployed env:
 //   railway run npm run remind
 
 import "dotenv/config";
 import { isMailConfigured } from "./mailer.js";
 import { log } from "./process.js";
-import { buildReminder, fetchCallCountsSafe, fetchFolderLinksSafe, reminderCc, reminderTo } from "./reminder.js";
-import { runReminderOnce } from "./scheduler.js";
+import {
+  buildJoeReminder,
+  buildReminder,
+  fetchCallCountsSafe,
+  fetchFolderLinksSafe,
+  joeReminderTo,
+  reminderCc,
+  reminderTo,
+} from "./reminder.js";
+import { runJoeReminderOnce, runReminderOnce } from "./scheduler.js";
 
 async function main(): Promise<void> {
-  const preview = process.argv.slice(2).includes("--preview");
+  const args = process.argv.slice(2);
+  const preview = args.includes("--preview");
+  const joe = args.includes("--joe");
 
   if (preview) {
     const now = new Date();
     const counts = await fetchCallCountsSafe(now);
     const links = counts ? await fetchFolderLinksSafe(counts, now) : {};
-    const { subject, text } = buildReminder(now, counts, links);
-    console.log(`To:      ${reminderTo()}`);
-    console.log(`Cc:      ${reminderCc()}`);
+    const { subject, text } = joe ? buildJoeReminder(now, counts, links) : buildReminder(now, counts, links);
+    console.log(`To:      ${joe ? joeReminderTo() : reminderTo()}`);
+    if (!joe) console.log(`Cc:      ${reminderCc()}`);
     console.log(`Subject: ${subject}`);
     console.log("");
     console.log(text);
@@ -39,7 +51,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const ok = await runReminderOnce("manual_script");
+  const ok = joe ? await runJoeReminderOnce("manual_script") : await runReminderOnce("manual_script");
   process.exit(ok ? 0 : 1);
 }
 

@@ -11,6 +11,7 @@
     "probe": "tsx src/probe.ts",
     "backfill": "tsx src/backfill.ts",
     "remind": "tsx src/send-reminder.ts",
+    "test:joe-reminder": "tsx src/test-joe-reminder.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js"

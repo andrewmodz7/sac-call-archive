@@ -13,7 +13,7 @@ import express, { type Request } from "express";
 import { getCall, verifySignature } from "./cloudtalk.js";
 import { isProcessed } from "./db.js";
 import { log, processCall } from "./process.js";
-import { runReminderOnce, startReminderScheduler } from "./scheduler.js";
+import { runJoeReminderOnce, runReminderOnce, startReminderScheduler } from "./scheduler.js";
 import { runBackfill } from "./backfill.js";
 import type { CloudtalkCall } from "./types.js";
 
@@ -64,6 +64,16 @@ app.post("/admin/send-reminder", (req, res) => {
   // Awaited so the caller sees the actual result, which is the whole point of
   // a test trigger. runReminderOnce never throws.
   void runReminderOnce("manual_endpoint").then((ok) => {
+    res.status(ok ? 200 : 500).json({ ok });
+  });
+});
+
+// Manual trigger for Joe's daily reminder email, same shape as
+// /admin/send-reminder but for Joe's own summary only.
+app.post("/admin/send-joe-reminder", (req, res) => {
+  if (!requireAdmin(req, res, "joe_reminder_trigger_rejected")) return;
+
+  void runJoeReminderOnce("manual_endpoint").then((ok) => {
     res.status(ok ? 200 : 500).json({ ok });
   });
 });

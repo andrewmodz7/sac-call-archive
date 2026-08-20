@@ -22,12 +22,20 @@ type FolderLinks = Record<string, Record<string, string | null>>;
 const DEFAULT_TO = "kdanna@shoreacrescapital.com";
 const DEFAULT_CC = "amodzelewski@shoreacrescapital.com";
 
+// Placeholder only. Set JOE_EMAIL before this ships, the real address has
+// not been provided yet.
+const DEFAULT_JOE = "REPLACE_ME_JOE_EMAIL@example.com";
+
 export function reminderTo(): string {
   return process.env.KENNETH_EMAIL || DEFAULT_TO;
 }
 
 export function reminderCc(): string {
   return process.env.ANDREW_EMAIL_CC || DEFAULT_CC;
+}
+
+export function joeReminderTo(): string {
+  return process.env.JOE_EMAIL || DEFAULT_JOE;
 }
 
 function requireEnv(name: string): string {
@@ -341,4 +349,98 @@ export async function sendReviewReminder(now: Date = new Date()): Promise<Remind
 
   const messageId = await sendMail({ to, cc, subject, text, html });
   return { to, cc, subject, message_id: messageId };
+}
+
+// Joe's slice of agentViews, or null if counts is null (CloudTalk fetch
+// failed) or Joe's view is somehow missing. Reuses agentViews rather than
+// recomputing anything: the split between Joe and everyone else already
+// lives there.
+function joeView(counts: CallCounts | null, links: FolderLinks): AgentCallView | null {
+  if (!counts) return null;
+  return agentViews(counts, links).find((view) => view.label === JOE) ?? null;
+}
+
+// Same three-state disposition rendering as callCountTextLines, scoped to
+// Joe only. A zero-call day still renders "Joe: 0 calls" rather than being
+// skipped, so the email always sends.
+function joeCallCountTextLines(counts: CallCounts | null, links: FolderLinks): string[] {
+  const view = joeView(counts, links);
+  if (!view) return ["Calls made today: count unavailable"];
+  const lines = ["Calls made today:", "", `Joe: ${view.total} calls`];
+  for (const [name, n] of view.dispositions) {
+    lines.push(dispositionLineText(name, n, view.folderLinks[name]));
+  }
+  return lines;
+}
+
+// Same block for the HTML part, scoped to Joe only.
+function joeCallCountHtmlLines(counts: CallCounts | null, links: FolderLinks): string[] {
+  const view = joeView(counts, links);
+  if (!view) return ["<p>Calls made today: count unavailable</p>"];
+  const lines = ["<p>Calls made today:</p>", `<p>Joe: ${view.total} calls</p>`];
+  if (view.dispositions.length > 0) {
+    lines.push("<ul>");
+    for (const [name, n] of view.dispositions) {
+      lines.push(`<li>${dispositionLineHtml(name, n, view.folderLinks[name])}</li>`);
+    }
+    lines.push("</ul>");
+  }
+  return lines;
+}
+
+// Joe's own daily summary: his total and his disposition breakdown only,
+// never Jay's or the combined total. Same counts/links inputs as
+// buildReminder, same three-state disposition rendering, no recomputation.
+export function buildJoeReminder(
+  now: Date,
+  counts: CallCounts | null = null,
+  links: FolderLinks = {},
+): ReminderContent {
+  const joeLink = folderLink(requireEnv("JOE_DRIVE_ROOT_FOLDER_ID"));
+  const date = displayDate(now);
+
+  const text = [
+    "Joe,",
+    "",
+    "Today's call recordings are ready to review.",
+    "",
+    `Recordings: ${joeLink}`,
+    "",
+    "Organized by disposition, then by day. Each disposition below links straight to today's folder once at least one call has been filed there.",
+    "",
+    ...joeCallCountTextLines(counts, links),
+    "",
+    `Date: ${date}`,
+    "",
+  ].join("\n");
+
+  const html = [
+    "<p>Joe,</p>",
+    "<p>Today's call recordings are ready to review.</p>",
+    `<p>Recordings: <a href="${joeLink}">${joeLink}</a></p>`,
+    "<p>Organized by disposition, then by day. Each disposition below links straight to today's folder once at least one call has been filed there.</p>",
+    ...joeCallCountHtmlLines(counts, links),
+    `<p>Date: ${date}</p>`,
+  ].join("\n");
+
+  return { subject: reminderSubject(now), text, html };
+}
+
+export interface JoeReminderResult {
+  to: string;
+  subject: string;
+  message_id: string;
+}
+
+// Build and send Joe's email. Mirrors sendReviewReminder: same counts/links
+// fetch, never blocks on a CloudTalk or Drive hiccup, throws only on the
+// send itself. No cc, single recipient.
+export async function sendJoeReminder(now: Date = new Date()): Promise<JoeReminderResult> {
+  const to = joeReminderTo();
+  const counts = await fetchCallCountsSafe(now);
+  const links = counts ? await fetchFolderLinksSafe(counts, now) : {};
+  const { subject, text, html } = buildJoeReminder(now, counts, links);
+
+  const messageId = await sendMail({ to, subject, text, html });
+  return { to, subject, message_id: messageId };
 }
